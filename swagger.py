@@ -1,3 +1,24 @@
+# -*- coding: utf-8 -*-
+# Swagger_Tester - Burp Suite Extension
+# Loads a Swagger/OpenAPI JSON, lets you modify URLs, params, and send
+# requests with multiple JWTs, displaying results in a grid.
+#
+# Installation:
+#   1. Ensure Jython standalone JAR is configured in Burp (Extender > Options > Python Environment)
+#   2. Go to Extender > Extensions > Add
+#   3. Extension type: Python
+#   4. Select this file
+#
+# Usage:
+#   1. Go to the "Swagger_Tester" tab
+#   2. Click "Load Swagger JSON" to load your OpenAPI/Swagger file
+#   3. Set the Base URL override if needed
+#   4. Select an endpoint from the dropdown
+#   5. Edit parameters in the parameter table
+#   6. Add one or more JWTs in the JWT panel
+#   7. Click "Send Requests" -- one request per JWT
+#   8. Click any row in the results table to view the full response
+
 from burp import IBurpExtender, ITab, IMessageEditorController
 from javax.swing import (
     JPanel, JButton, JLabel, JTextField, JTextArea, JScrollPane,
@@ -240,8 +261,23 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         topPanel.add(self._userAgentField, gbc)
         gbc.gridwidth = 1
 
-        # State save / load row
         gbc.gridx = 0; gbc.gridy = 3; gbc.weightx = 0
+        gbc.anchor = GridBagConstraints.NORTHWEST
+        topPanel.add(JLabel("Headers:"), gbc)
+        gbc.anchor = GridBagConstraints.WEST
+        self._customHeadersArea = JTextArea(3, 40)
+        self._customHeadersArea.setLineWrap(False)
+        self._customHeadersArea.setFont(Font("Monospaced", Font.PLAIN, 11))
+        self._customHeadersArea.setToolTipText("One custom header per line (e.g. X-Forwarded-For: 127.0.0.1)")
+        customHdrScroll = JScrollPane(self._customHeadersArea)
+        gbc.gridx = 1; gbc.weightx = 1.0; gbc.gridwidth = 2
+        gbc.fill = GridBagConstraints.BOTH
+        topPanel.add(customHdrScroll, gbc)
+        gbc.fill = GridBagConstraints.HORIZONTAL
+        gbc.gridwidth = 1
+
+        # State save / load row
+        gbc.gridx = 0; gbc.gridy = 4; gbc.weightx = 0
         topPanel.add(JLabel("Session:"), gbc)
 
         stateRow = JPanel(FlowLayout(FlowLayout.LEFT, 6, 0))
@@ -331,15 +367,20 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         rgbc.gridx = 0; rgbc.gridy = 0; rgbc.weightx = 0
         refreshPanel.add(JLabel("Mode:"), rgbc)
         self._loginModeCombo = JComboBox([
-            "Direct POST (JSON)",
-            "Direct POST (Form-encoded)",
+            "Direct POST",
             "Keycloak Browser Flow"])
-        self._loginModeCombo.setToolTipText(
-            "JSON/Form: single POST to login URL. "
-            "Keycloak: follows full redirect chain automatically.")
-        rgbc.gridx = 1; rgbc.weightx = 1.0; rgbc.gridwidth = 3
+        rgbc.gridx = 1; rgbc.weightx = 0.5
         refreshPanel.add(self._loginModeCombo, rgbc)
-        rgbc.gridwidth = 1
+
+        rgbc.gridx = 2; rgbc.weightx = 0
+        refreshPanel.add(JLabel("  Content-Type:"), rgbc)
+        self._loginContentTypeCombo = JComboBox([
+            "application/json",
+            "application/x-www-form-urlencoded"])
+        self._loginContentTypeCombo.setEditable(True)
+        self._loginContentTypeCombo.setToolTipText("Content-Type for Direct POST login requests")
+        rgbc.gridx = 3; rgbc.weightx = 0.5
+        refreshPanel.add(self._loginContentTypeCombo, rgbc)
 
         rgbc.gridx = 0; rgbc.gridy = 1; rgbc.weightx = 0
         refreshPanel.add(JLabel("Login URL:"), rgbc)
@@ -439,9 +480,17 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
 
         # Button row
         paramsBtnRow = JPanel(FlowLayout(FlowLayout.LEFT, 6, 4))
-        self._autoFillBtn = JButton("Auto-fill from Proxy History",
+        self._autoFillBtn = JButton("Auto-fill from Burp",
                                      actionPerformed=self._onAutoFillGlobalParams)
         paramsBtnRow.add(self._autoFillBtn)
+        self._includeProxyCb = JCheckBox("Proxy History", True)
+        paramsBtnRow.add(self._includeProxyCb)
+        self._includeSiteMapCb = JCheckBox("Site Map")
+        paramsBtnRow.add(self._includeSiteMapCb)
+        importBtn = JButton("Import Values from File",
+                            actionPerformed=self._onImportValuesFile)
+        importBtn.setToolTipText("Load param values from CSV (Logger++ export), JSON, or key=value text file")
+        paramsBtnRow.add(importBtn)
         self._applyGlobalBtn = JButton("Apply Values to All Endpoints",
                                         actionPerformed=self._onApplyGlobalParams)
         paramsBtnRow.add(self._applyGlobalBtn)
@@ -848,7 +897,9 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         self._autoScanPaused = False
         self._resumeBtn.setEnabled(False)
         self._pauseScanBtn.setEnabled(True)
+        self._stopScanBtn.setEnabled(True)
         self._statusLabel.setText("Resuming...")
+        # Release multiple permits in case both batch and manual pause were triggered
         self._pauseSemaphore.release()
 
     def _onPauseScan(self):
@@ -862,11 +913,16 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         """Stop the auto scan permanently."""
         self._autoScanStopped = True
         self._autoScanPaused = False
+        # Release semaphore in case thread is blocked on pause or batch
+        self._pauseSemaphore.release()
+        # Re-enable ALL buttons immediately (don't rely on runner thread)
         self._pauseScanBtn.setEnabled(False)
         self._stopScanBtn.setEnabled(False)
         self._resumeBtn.setEnabled(False)
-        # Release semaphore in case thread is blocked on pause
-        self._pauseSemaphore.release()
+        self._autoScanBtn.setEnabled(True)
+        self._sendBtn.setEnabled(True)
+        if hasattr(self, '_fuzzScanBtn'):
+            self._fuzzScanBtn.setEnabled(len(self._wordlist) > 0 and len(self._endpoints) > 0)
         self._statusLabel.setText("Scan stopped by user.")
 
     # -- Session Refresh ----------------------------------------------------
@@ -900,7 +956,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         if mode == "Keycloak Browser Flow":
             return self._doKeycloakFlow(login_url, login_body)
         else:
-            content_type = "application/json" if "JSON" in mode else "application/x-www-form-urlencoded"
+            content_type = str(self._loginContentTypeCombo.getSelectedItem() or "application/json")
             return self._doDirectLogin(login_url, login_body, content_type)
 
     def _doDirectLogin(self, login_url, login_body, content_type):
@@ -928,6 +984,8 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
                 "Accept: */*",
                 "Connection: close",
             ]
+            for _ch in self._getCustomHeaders():
+                headers.append(_ch)
 
             body_bytes = None
             if login_body:
@@ -1298,6 +1356,8 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
             body_bytes = helpers.stringToBytes(body)
 
         headers.append("Connection: close")
+        for _ch in self._getCustomHeaders():
+            headers.append(_ch)
         request = helpers.buildHttpMessage(headers, body_bytes)
         http_service = helpers.buildHttpService(host, port, use_https)
 
@@ -1415,9 +1475,21 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         except Exception:
             return 0
 
+    def _getCustomHeaders(self):
+        """Parse custom headers text area. Returns list of 'Name: value' strings."""
+        raw = self._customHeadersArea.getText()
+        headers = []
+        for line in raw.split("\n"):
+            line = line.strip()
+            if line and ":" in line:
+                headers.append(line)
+        return headers
+
     def _resetPause(self):
-        """Reset pause state for a new run."""
+        """Reset pause/stop state for a new run."""
         self._requestCounter = 0
+        self._autoScanStopped = False
+        self._autoScanPaused = False
         self._pauseSemaphore.drainPermits()
         self._resumeBtn.setEnabled(False)
 
@@ -1925,7 +1997,9 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         for r in range(self._globalParamModel.getRowCount()):
             param_names.add(str(self._globalParamModel.getValueAt(r, 0)))
 
-        runner = _GlobalParamFillRunner(self, param_names)
+        runner = _GlobalParamFillRunner(self, param_names,
+                                        self._includeProxyCb.isSelected(),
+                                        self._includeSiteMapCb.isSelected())
         JThread(runner).start()
 
     def _onGlobalParamFillDone(self, cache, all_values):
@@ -1972,6 +2046,118 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
                 self._paramModel.setValueAt(self._globalParams[pname], r, 4)
 
         self._statusLabel.setText("Applied %d global parameter values." % applied)
+
+    def _onImportValuesFile(self, event):
+        """Import param values from a file. Supports CSV, JSON, or key=value text."""
+        chooser = JFileChooser()
+        chooser.setDialogTitle("Import Parameter Values")
+        if chooser.showOpenDialog(self._mainPanel) != JFileChooser.APPROVE_OPTION:
+            return
+
+        path = chooser.getSelectedFile().getAbsolutePath()
+        try:
+            with open(path, "r") as f:
+                raw = f.read()
+        except Exception as e:
+            JOptionPane.showMessageDialog(self._mainPanel,
+                "Failed to read file:\n%s" % str(e), "Error",
+                JOptionPane.ERROR_MESSAGE)
+            return
+
+        imported = {}  # {param_name: [values]}
+
+        # Collect all param names we know about
+        known_params = set()
+        for r in range(self._globalParamModel.getRowCount()):
+            known_params.add(str(self._globalParamModel.getValueAt(r, 0)))
+
+        # Try JSON first
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if k in known_params:
+                        imported.setdefault(k, []).append(str(v))
+                    elif isinstance(v, dict):
+                        for kk, vv in v.items():
+                            if kk in known_params:
+                                imported.setdefault(kk, []).append(str(vv))
+        except Exception:
+            pass
+
+        # Try CSV (Logger++ format: look for param names in URL, request body, etc.)
+        if not imported:
+            import re
+            lines = raw.split("\n")
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                # key=value format
+                if "=" in line and "," not in line:
+                    parts = line.split("=", 1)
+                    k = parts[0].strip()
+                    v = parts[1].strip()
+                    if k in known_params:
+                        imported.setdefault(k, []).append(v)
+                    continue
+                # CSV: try to find param=value patterns in URLs and bodies
+                pairs = re.findall(r'([A-Za-z_][A-Za-z0-9_]*)=([^&,\s"]+)', line)
+                for k, v in pairs:
+                    if k in known_params:
+                        imported.setdefault(k, []).append(v)
+                # JSON fragments in CSV fields
+                json_matches = re.findall(r'\{[^}]+\}', line)
+                for jm in json_matches:
+                    try:
+                        obj = json.loads(jm)
+                        if isinstance(obj, dict):
+                            for k, v in obj.items():
+                                if k in known_params and v is not None:
+                                    imported.setdefault(k, []).append(str(v))
+                    except Exception:
+                        pass
+
+        if not imported:
+            JOptionPane.showMessageDialog(self._mainPanel,
+                "No matching parameter values found in file.\n"
+                "Supported formats:\n"
+                "  - JSON: {\"param\": \"value\", ...}\n"
+                "  - Text: param=value (one per line)\n"
+                "  - CSV with param=value in URLs or JSON bodies",
+                "No values found", JOptionPane.INFORMATION_MESSAGE)
+            return
+
+        # Apply first value for each param, store all in proxy cache
+        if self._globalParamTable.isEditing():
+            self._globalParamTable.getCellEditor().stopCellEditing()
+
+        filled = 0
+        all_values = getattr(self, '_globalProxyCache', {})
+
+        for r in range(self._globalParamModel.getRowCount()):
+            name = str(self._globalParamModel.getValueAt(r, 0))
+            if name in imported:
+                values = imported[name]
+                # Set first value
+                current = str(self._globalParamModel.getValueAt(r, 6) or "")
+                if not current:
+                    self._globalParamModel.setValueAt(values[0], r, 6)
+                    filled += 1
+                # Update Found count
+                existing = all_values.get(name, [])
+                for v in values:
+                    entry = (v, path, "imported")
+                    if entry not in existing:
+                        existing.append(entry)
+                all_values[name] = existing
+                self._globalParamModel.setValueAt(str(len(existing)), r, 5)
+
+        self._globalProxyCache = all_values
+
+        self._statusLabel.setText(
+            "Imported: %d params found (%d values total), %d auto-filled. Source: %s" % (
+                len(imported), sum(len(v) for v in imported.values()), filled, path))
 
     def _onBulkFillByType(self, event):
         """Fill placeholder values for parameters matching the selected type."""
@@ -2227,6 +2413,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         state["swagger_path"] = self._filePathField.getText()
         state["base_url"] = self._baseUrlField.getText()
         state["user_agent"] = self._userAgentField.getText()
+        state["custom_headers"] = self._customHeadersArea.getText()
         state["batch_size"] = self._batchSizeField.getText()
         state["bypass_confirm"] = self._bypassConfirmCb.isSelected()
 
@@ -2261,11 +2448,16 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
 
         # Session refresh config
         state["login_mode"] = self._loginModeCombo.getSelectedItem()
+        state["login_content_type"] = str(self._loginContentTypeCombo.getSelectedItem() or "")
         state["login_url"] = self._loginUrlField.getText()
         state["extract_mode"] = self._extractCombo.getSelectedItem()
         state["extract_field"] = self._extractFieldName.getText()
         state["auto_refresh"] = self._autoRefreshCb.isSelected()
         state["per_request_refresh"] = self._perRequestRefreshCb.isSelected()
+
+        # Parameters tab settings
+        state["include_proxy"] = self._includeProxyCb.isSelected()
+        state["include_sitemap"] = self._includeSiteMapCb.isSelected()
 
         return state
 
@@ -2306,6 +2498,11 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         user_agent = state.get("user_agent", "")
         if user_agent:
             self._userAgentField.setText(user_agent)
+
+        # 2b2. Custom headers
+        custom_headers = state.get("custom_headers", "")
+        if custom_headers:
+            self._customHeadersArea.setText(custom_headers)
 
         # 2c. Batch size
         batch_size = state.get("batch_size", "")
@@ -2360,6 +2557,9 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         login_mode = state.get("login_mode", "")
         if login_mode:
             self._loginModeCombo.setSelectedItem(login_mode)
+        login_ct = state.get("login_content_type", "")
+        if login_ct:
+            self._loginContentTypeCombo.setSelectedItem(login_ct)
         login_url = state.get("login_url", "")
         if login_url:
             self._loginUrlField.setText(login_url)
@@ -2373,6 +2573,12 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
             self._autoRefreshCb.setSelected(True)
         if state.get("per_request_refresh", False):
             self._perRequestRefreshCb.setSelected(True)
+
+        # 5c. Parameters tab settings
+        if "include_proxy" in state:
+            self._includeProxyCb.setSelected(state["include_proxy"])
+        if "include_sitemap" in state:
+            self._includeSiteMapCb.setSelected(state["include_sitemap"])
 
     def _onSaveState(self, event):
         """Save current state to a JSON file chosen by the user."""
@@ -2504,11 +2710,13 @@ class _GlobalProxyValClickListener(MouseAdapter):
 # -- Global param proxy fill runner -----------------------------------------
 
 class _GlobalParamFillRunner(Runnable):
-    """Scans proxy history and collects ALL values for each param name."""
+    """Scans Burp sources (Proxy History and/or Site Map) and collects ALL values for each param name."""
 
-    def __init__(self, extender, param_names):
+    def __init__(self, extender, param_names, include_proxy=True, include_sitemap=False):
         self._ext = extender
         self._param_names = param_names
+        self._include_proxy = include_proxy
+        self._include_sitemap = include_sitemap
 
     def run(self):
         helpers = self._ext._helpers
@@ -2516,9 +2724,32 @@ class _GlobalParamFillRunner(Runnable):
         all_values = {}  # {name: [(value, url, source), ...]}
         seen = {}        # {(name, value): True} for dedup
 
-        try:
-            history = self._ext._callbacks.getProxyHistory()
-            for item in history:
+        sources = []
+        if self._include_proxy:
+            try:
+                proxy_items = self._ext._callbacks.getProxyHistory()
+                sources.append(("Proxy", proxy_items))
+            except Exception:
+                pass
+        if self._include_sitemap:
+            try:
+                sitemap_items = self._ext._callbacks.getSiteMap("")
+                sources.append(("SiteMap", sitemap_items))
+            except Exception:
+                pass
+
+        if not sources:
+            class _NoSrc(Runnable):
+                def run(s):
+                    self._ext._onGlobalParamFillDone({}, {})
+                    self._ext._statusLabel.setText("No source selected -- check Proxy History or Site Map.")
+            SwingUtilities.invokeLater(_NoSrc())
+            return
+
+        for source_name, items in sources:
+            self._ext._callbacks.printOutput(
+                "[ParamFill] Scanning %s: %d items..." % (source_name, len(items)))
+            for item in items:
                 try:
                     req_bytes = item.getRequest()
                     if req_bytes is None:
@@ -2580,8 +2811,6 @@ class _GlobalParamFillRunner(Runnable):
                             pass
                 except Exception:
                     continue
-        except Exception:
-            pass
 
         class _Done(Runnable):
             def __init__(s):
@@ -3007,6 +3236,8 @@ class _AutoScanRunner(Runnable):
                 "Accept: */*",
                 "Connection: close",
             ]
+            for _ch in self._ext._getCustomHeaders():
+                headers.append(_ch)
 
             body_bytes = None
             if body_obj and method in ("POST", "PUT", "PATCH"):
@@ -3233,7 +3464,7 @@ class _FuzzScanRunner(Runnable):
                         method, path_template, fuzzed_params)
 
                     # Batch pause check
-                    if self._batch_size > 0:
+                    if self._batch_size > 0 and not self._ext._autoScanStopped:
                         self._ext._requestCounter += 1
                         if self._ext._requestCounter % self._batch_size == 0:
                             class _Pause(Runnable):
@@ -3244,6 +3475,8 @@ class _FuzzScanRunner(Runnable):
                                         self._ext._requestCounter)
                             SwingUtilities.invokeLater(_Pause())
                             self._ext._pauseSemaphore.acquire()
+                            if self._ext._autoScanStopped:
+                                break
 
         # Done
         class _Done(Runnable):
@@ -3317,6 +3550,8 @@ class _FuzzScanRunner(Runnable):
                 "Accept: */*",
                 "Connection: close",
             ]
+            for _ch in self._ext._getCustomHeaders():
+                headers.append(_ch)
 
             body_bytes = None
             if body_obj and method in ("POST", "PUT", "PATCH"):
@@ -3468,6 +3703,8 @@ class _ResendEndpointRunner(Runnable):
                 "Accept: */*",
                 "Connection: close",
             ]
+            for _ch in self._ext._getCustomHeaders():
+                headers.append(_ch)
 
             body_bytes = None
             if body_obj and self._method in ("POST", "PUT", "PATCH"):
@@ -3624,6 +3861,8 @@ class _PendingEndpointRunner(Runnable):
                 "Accept: */*",
                 "Connection: close",
             ]
+            for _ch in self._ext._getCustomHeaders():
+                headers.append(_ch)
 
             body_bytes = None
             if body_obj and method in ("POST", "PUT", "PATCH"):
@@ -3794,6 +4033,8 @@ class _RequestRunner(Runnable):
 
     def _checkPause(self, current_row, total):
         """Check if we should pause for batch limit."""
+        if self._ext._autoScanStopped:
+            return
         if self._batch_size > 0:
             self._ext._requestCounter += 1
             if self._ext._requestCounter % self._batch_size == 0:
@@ -3805,6 +4046,9 @@ class _RequestRunner(Runnable):
                                 self._ext._requestCounter, self._batch_size, current_row, total))
                 SwingUtilities.invokeLater(_Pause())
                 self._ext._pauseSemaphore.acquire()
+                # After resume, check if stop was pressed while waiting
+                if self._ext._autoScanStopped:
+                    return
 
     def _doRequest(self, auth_type, auth_value):
         import time
@@ -3863,6 +4107,8 @@ class _RequestRunner(Runnable):
             "Accept: */*",
             "Connection: close",
         ]
+        for _ch in self._ext._getCustomHeaders():
+            headers.append(_ch)
 
         body_bytes = None
         if body_obj and self._method in ("POST", "PUT", "PATCH"):
